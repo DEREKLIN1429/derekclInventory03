@@ -1,394 +1,282 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { ScanMode, Language } from '../types.ts';
-import { TRANSLATIONS } from '../constants.ts';
 
-interface ScannerProps {
-  mode: ScanMode;
-  onScan: (text: string) => void;
-  isScanning: boolean;
-  onToggleScan: (active: boolean) => void;
-  triggerFlash: boolean;
-  language: Language;
-  minLen: number;
-  maxLen: number;
-}
+import React, { useState, useEffect, useCallback } from 'react';
+import { InventoryMap, AppSettings, ScanMode, InventoryItem, Language } from './types.ts';
+import { DEFAULT_SETTINGS, SYSTEM_CONFIG, TRANSLATIONS } from './constants.ts';
+import { Scanner } from './components/Scanner.tsx';
+import { SettingsModal } from './components/SettingsModal.tsx';
+import { InventoryTable } from './components/InventoryTable.tsx';
 
-const playBeep = () => {
-    try {
-        const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
-        if (!AudioContext) return;
-        const ctx = new AudioContext();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.type = "sine"; 
-        osc.frequency.setValueAtTime(1500, ctx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(800, ctx.currentTime + 0.1);
-        gain.gain.setValueAtTime(0.1, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
-        osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.15);
-        setTimeout(() => { if (ctx.state !== 'closed') ctx.close(); }, 200);
-    } catch (e) {}
-};
+const App: React.FC = () => {
+  // --- State ---
+  const [user, setUser] = useState<string>("Default");
+  // 將預設選取項從 0 (G) 改為 1 (Q1/H)
+  const [checkIndex, setCheckIndex] = useState<number>(1); 
+  const [mode, setMode] = useState<ScanMode>('barcode');
+  const [inventory, setInventory] = useState<InventoryMap>({});
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [isScanning, setIsScanning] = useState(false);
+  const [flashOn, setFlashOn] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadingText, setLoadingText] = useState("");
+  const [authStatus, setAuthStatus] = useState<'pending' | 'authorized' | 'unauthorized'>('authorized');
+  const [currentUserEmail, setCurrentUserEmail] = useState<string>("");
+  const [language, setLanguage] = useState<Language>('zh-TW');
+  const [isLangModalOpen, setIsLangModalOpen] = useState(false);
 
-export const Scanner: React.FC<ScannerProps> = ({ 
-  mode, 
-  onScan, 
-  isScanning, 
-  onToggleScan,
-  triggerFlash,
-  language,
-  minLen,
-  maxLen
-}) => {
-  const barcodeScannerRef = useRef<any>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  
   const t = TRANSLATIONS[language];
-  
-  // OCR State
-  const [ocrQuality, setOcrQuality] = useState(false);
-  const [ocrText, setOcrText] = useState(t.ocrWait);
-  const [streamTrack, setStreamTrack] = useState<MediaStreamTrack | null>(null);
-  const ocrIntervalRef = useRef<number | null>(null);
 
-  // Barcode State
-  const [tempCode, setTempCode] = useState<string | null>(null);
-
-  // Update initial text when mode/language changes
   useEffect(() => {
-      if (!isScanning) {
-          setTempCode(null);
-          setOcrText(t.ocrWait);
-      }
-  }, [language, isScanning, t.ocrWait]);
-
-  const clearOverlay = () => {
-      if (overlayCanvasRef.current) {
-          const ctx = overlayCanvasRef.current.getContext('2d');
-          ctx?.clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height);
-      }
-  };
-
-  // --- Barcode Logic (Html5Qrcode) ---
-  const startBarcodeScanner = useCallback(async () => {
-    if (!window.Html5Qrcode) {
-        alert("Error: Html5Qrcode library not loaded.");
-        return;
+    const savedUser = localStorage.getItem('currentUser') || "Default";
+    setUser(savedUser);
+    const savedLang = localStorage.getItem('appLanguage') as Language;
+    if (savedLang && ['zh-TW', 'en', 'hi'].includes(savedLang)) setLanguage(savedLang);
+    
+    // 如果上次儲存的是 0，則強制轉為 1
+    const savedIndex = localStorage.getItem('lastCheckIndex');
+    if (savedIndex) {
+      const idx = parseInt(savedIndex);
+      setCheckIndex(idx === 0 ? 1 : idx);
     }
     
-    if (barcodeScannerRef.current) {
-        try { await barcodeScannerRef.current.stop(); barcodeScannerRef.current.clear(); } catch(e) {}
-    }
-
-    if (!document.getElementById("reader")) return;
-
-    const html5QrCode = new window.Html5Qrcode("reader");
-    barcodeScannerRef.current = html5QrCode;
-
-    const config = { 
-        fps: 15, 
-        qrbox: { width: 250, height: 250 }, 
-        aspectRatio: 1.0,
-        disableFlip: false 
-    };
-    
-    try {
-      await html5QrCode.start(
-        { facingMode: "environment" },
-        config,
-        (decodedText: string, decodedResult: any) => {
-            if (tempCode !== decodedText) {
-                 setTempCode(decodedText);
-                 playBeep(); 
-            }
-        },
-        (errorMessage: string) => {}
-      );
-      
-      // Attempt to apply flash if it was already on
-      if (triggerFlash) {
-          setTimeout(() => {
-            try {
-                html5QrCode.applyVideoConstraints({
-                     advanced: [{ torch: true }]
-                }).catch((err: any) => console.warn("Barcode start flash error:", err));
-            } catch(e) {}
-          }, 500);
-      }
-
-    } catch (err) {
-      console.error("Error starting barcode scanner", err);
-      alert(`Camera failed: ${err}`);
-      onToggleScan(false);
-    }
-  }, [onToggleScan, tempCode, triggerFlash]);
-
-  const stopBarcodeScanner = useCallback(async () => {
-    if (barcodeScannerRef.current) {
-      try {
-        await barcodeScannerRef.current.stop();
-        barcodeScannerRef.current.clear();
-      } catch (e) {}
-      barcodeScannerRef.current = null;
-      clearOverlay();
-    }
+    const savedSettings = localStorage.getItem('appSettings');
+    if (savedSettings) setSettings({...DEFAULT_SETTINGS, ...JSON.parse(savedSettings)});
+    loadInventory(savedUser);
+    checkPermission();
   }, []);
 
-  // --- OCR Logic ---
-  const startOcrCamera = useCallback(async () => {
+  const calculateAvg = (item: Partial<InventoryItem>) => {
+    const vals = [item.qty1, item.qty2, item.qty3, item.qty4, item.qty5]
+      .map(v => typeof v === 'number' ? v : parseFloat(v as any))
+      .filter(v => !isNaN(v) && v !== undefined && v !== null);
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+  };
+
+  const checkPermission = async () => {
     try {
-      const constraints = { 
-          video: { 
-              facingMode: "environment", 
-              width: { ideal: 3840 }, 
-              height: { ideal: 2160 },
-              focusMode: "continuous"
-          } 
-      };
-
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        const track = stream.getVideoTracks()[0];
-        setStreamTrack(track); // This triggers the useEffect below to apply flash
-        
-        if (ocrIntervalRef.current) clearInterval(ocrIntervalRef.current);
-        ocrIntervalRef.current = window.setInterval(analyzeFrame, 300);
-      }
-    } catch (err) {
-      alert("OCR Camera Error: " + err);
-      onToggleScan(false);
-    }
-  }, [onToggleScan]); // Note: triggerFlash isn't needed here as setStreamTrack triggers the effect
-
-  const stopOcrCamera = useCallback(() => {
-    if (streamTrack) {
-      streamTrack.stop();
-      setStreamTrack(null);
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    if (ocrIntervalRef.current) {
-      clearInterval(ocrIntervalRef.current);
-      ocrIntervalRef.current = null;
-    }
-  }, [streamTrack]);
-
-  const analyzeFrame = () => {
-    if (!videoRef.current || !canvasRef.current) return;
-    const video = videoRef.current;
-    
-    if (video.readyState === 4) {
-        const canvas = canvasRef.current;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if(!ctx) return;
-
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        
-        // Analyze center strip
-        const cropWidth = canvas.width * 0.9;
-        const cropHeight = canvas.height * 0.045;
-        const cropX = (canvas.width - cropWidth) / 2;
-        const cropY = (canvas.height - cropHeight) / 2;
-        
-        ctx.drawImage(video, 0, 0);
-        const imgData = ctx.getImageData(cropX, cropY, cropWidth, cropHeight);
-        
-        const score = calculateContrast(imgData.data);
-        setOcrQuality(score > 40);
-    }
-  };
-
-  const calculateContrast = (data: Uint8ClampedArray) => {
-    let sum = 0, count = 0;
-    for (let i = 0; i < data.length; i += 80) {
-        sum += (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114); count++;
-    }
-    const mean = sum / count;
-    let variance = 0;
-    for (let i = 0; i < data.length; i += 80) {
-        const gray = (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114);
-        variance += Math.pow(gray - mean, 2);
-    }
-    return Math.sqrt(variance / count);
-  };
-
-  const captureOcr = async () => {
-    if (!videoRef.current || !window.Tesseract) return;
-    setOcrText(t.ocrProcessing);
-
-    const video = videoRef.current;
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    ctx.drawImage(video, 0, 0);
-    
-    const cropHeight = canvas.height * 0.045; 
-    const cropY = (canvas.height - cropHeight) / 2;
-    
-    const cropCanvas = document.createElement('canvas');
-    cropCanvas.width = canvas.width;
-    cropCanvas.height = cropHeight;
-    const cropCtx = cropCanvas.getContext('2d');
-    
-    cropCtx?.drawImage(canvas, 0, cropY, canvas.width, cropHeight, 0, 0, cropCanvas.width, cropCanvas.height);
-    
-    try {
-        const { data: { text } } = await window.Tesseract.recognize(
-            cropCanvas.toDataURL('image/jpeg'),
-            'eng',
-            { 
-                tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-',
-                tessedit_pageseg_mode: '7' 
-            }
-        );
-
-        let cleanText = text.replace(/[^a-zA-Z0-9.-]/g, "");
-        const strongPattern = /[A-Z0-9]+(-[A-Z0-9.]+){3,}/;
-        const match = cleanText.match(strongPattern);
-        if (match) { cleanText = match[0]; }
-        cleanText = cleanText.replace(/^[-.]+|[-.]+$/g, "");
-
-        if(cleanText.length > 2) { 
-            playBeep();
-            onScan(cleanText);
-            setOcrText(t.ocrWait);
-        } else {
-            setOcrText("⚠️ No text detected");
-        }
-    } catch (err) {
-        alert("OCR Error: " + err);
-        setOcrText(t.ocrWait);
-    }
-  };
-
-  // --- Camera Management Effects ---
-  useEffect(() => {
-    const manageCamera = async () => {
-      await stopBarcodeScanner();
-      stopOcrCamera();
-
-      if (isScanning) {
-        setTempCode(null);
-        if (mode === 'barcode') {
-          setTimeout(() => startBarcodeScanner(), 300);
-        } else {
-          setTimeout(() => startOcrCamera(), 300);
-        }
-      }
-    };
-    manageCamera();
-    return () => {
-      stopBarcodeScanner();
-      stopOcrCamera();
-    };
-  }, [mode, isScanning]);
-
-  // Flash Effect - Robust Implementation
-  useEffect(() => {
-    // OCR Mode Flash
-    if (mode === 'ocr' && streamTrack) {
-        // Try/Catch block to handle devices that don't report capabilities correctly but support torch
+        const response = await fetch(SYSTEM_CONFIG.API_URL, {
+            method: 'POST',
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({ action: "checkAuth" })
+        });
+        const text = await response.text();
         try {
-            streamTrack.applyConstraints({ advanced: [{ torch: triggerFlash }] } as any)
-               .catch(err => console.warn("OCR Flash Error (likely unsupported):", err));
-        } catch (e) {
-            console.warn("OCR Flash Exception:", e);
-        }
-    }
+            const result = JSON.parse(text);
+            if (result && result.email) setCurrentUserEmail(result.email);
+        } catch (e) {}
+    } catch (e) {}
+  };
 
-    // Barcode Mode Flash
-    if (mode === 'barcode' && barcodeScannerRef.current) {
-         try {
-             barcodeScannerRef.current.applyVideoConstraints({
-                 advanced: [{ torch: triggerFlash }]
-             }).catch((err: any) => console.warn("Barcode Flash Error:", err));
-         } catch(e) {
-             console.warn("Barcode Flash Exception:", e);
-         }
-    }
-  }, [triggerFlash, streamTrack, mode]);
+  const changeLanguage = (lang: Language) => {
+      setLanguage(lang);
+      localStorage.setItem('appLanguage', lang);
+      setIsLangModalOpen(false);
+  };
 
-  // Main interaction handler
-  const handleViewportClick = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!isScanning) {
-        onToggleScan(true);
-    } else {
-        if (mode === 'barcode') {
-            if (tempCode) {
-                 const confirmMsg = (language === 'zh-TW') 
-                    ? `掃描到資料：\n${tempCode}\n\n確定要使用嗎？` 
-                    : `Scanned Data:\n${tempCode}\n\nConfirm to use?`;
-                    
-                 if (window.confirm(confirmMsg)) {
-                     onScan(tempCode);
-                 } else {
-                     setTempCode(null);
-                 }
-            }
-        } else if (mode === 'ocr') {
-            captureOcr();
+  const loadInventory = (userId: string) => {
+    const data = localStorage.getItem(`inventory_${userId}`);
+    setInventory(data ? JSON.parse(data) : {});
+  };
+
+  const handleUserChange = (newUser: string) => {
+    const cleanUser = newUser.trim() || "Default";
+    setUser(cleanUser);
+    localStorage.setItem('currentUser', cleanUser);
+    loadInventory(cleanUser);
+  };
+  
+  const handleCheckIndexChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+      const val = parseInt(e.target.value);
+      setCheckIndex(val);
+      localStorage.setItem('lastCheckIndex', val.toString());
+  };
+
+  const handleSaveItem = (initialCode: string) => {
+    setIsScanning(false);
+    setTimeout(() => {
+        let codeInput = prompt(t.confirmCode, initialCode);
+        if (codeInput === null) return;
+        let code = codeInput.replace(/[^a-zA-Z0-9.-]/g, "").trim();
+        if (!code) return;
+        if (code.length < settings.minLen) return alert(`${t.tooShort}${settings.minLen})`);
+
+        const existingItem = inventory[code];
+        const defaultName = existingItem ? existingItem.name : (code.split('-')[0] || "");
+        const nameInput = prompt(t.confirmName, defaultName);
+        if (nameInput === null) return;
+        const name = nameInput.trim() || "No Name";
+
+        // checkIndex 目前保證為 1-5，直接使用
+        const targetIndex = checkIndex;
+        const targetLabel = TRANSLATIONS[language][(`count${targetIndex}` as keyof typeof TRANSLATIONS['zh-TW'])];
+        
+        let currentStoredQty: number | undefined;
+        if (existingItem) {
+             currentStoredQty = (existingItem as any)[`qty${targetIndex}`];
         }
+        const defaultQty = (currentStoredQty !== undefined && currentStoredQty !== 0) ? currentStoredQty.toString() : "";
+        const qtyStr = prompt(`${t.confirmQty} (${targetLabel})`, defaultQty);
+        if (qtyStr === null) return;
+        let qty = parseFloat(qtyStr);
+        if (isNaN(qty)) qty = 0;
+
+        // 修正：儲位 (Location) 欄位始終保持淨空待輸入狀態，預設值為空，強制手動輸入
+        let locationPrompt = prompt(t.confirmLoc, "");
+        if (locationPrompt === null) return;
+        const location = locationPrompt.trim();
+
+        const d = new Date();
+        const istTime = d.toISOString().replace(/T/, ' ').replace(/\..+/, '');
+
+        const newItem: InventoryItem = {
+            name: name,
+            location: location,
+            scanTime: istTime,
+            qty: 0,
+            qty1: (targetIndex === 1) ? qty : (existingItem?.qty1),
+            qty2: (targetIndex === 2) ? qty : (existingItem?.qty2),
+            qty3: (targetIndex === 3) ? qty : (existingItem?.qty3),
+            qty4: (targetIndex === 4) ? qty : (existingItem?.qty4),
+            qty5: (targetIndex === 5) ? qty : (existingItem?.qty5),
+        };
+        
+        // 自動計算平均值
+        newItem.qty = calculateAvg(newItem);
+
+        const newInventory = { ...inventory, [code]: newItem };
+        setInventory(newInventory);
+        localStorage.setItem(`inventory_${user}`, JSON.stringify(newInventory));
+    }, 100);
+  };
+
+  const handleUpdateQty = (code: string, field: keyof InventoryItem) => {
+      if (field === 'qty') return; // G 欄位不可手動修改
+      const item = inventory[code];
+      if (!item) return;
+      const currentVal = item[field];
+      const displayVal = (currentVal !== undefined && currentVal !== 0) ? currentVal : "";
+      const newValStr = prompt(`${t.editPrompt} (${field})`, String(displayVal));
+      if (newValStr === null) return;
+      let newVal = newValStr.trim() === "" ? 0 : parseFloat(newValStr);
+      if (isNaN(newVal)) return alert("Invalid Number");
+
+      const newItem = { ...item, [field]: newVal };
+      newItem.qty = calculateAvg(newItem);
+      const newInventory = { ...inventory, [code]: newItem };
+      setInventory(newInventory);
+      localStorage.setItem(`inventory_${user}`, JSON.stringify(newInventory));
+  };
+
+  const handleExportExcel = () => {
+    if (Object.keys(inventory).length === 0) return alert(t.noData);
+    
+    const escapeCSV = (val: any) => {
+      if (val === null || val === undefined) return '""';
+      const str = String(val);
+      if (str.includes('"') || str.includes(',') || str.includes('\n')) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return `"${str}"`;
+    };
+
+    const headers = [
+      t.tableCode, t.tableName, t.tableLoc, t.tableQty, 
+      t.count1, t.count2, t.count3, t.count4, t.count5, "Scan Time"
+    ];
+    
+    const rows = Object.entries(inventory).map(([code, item]) => [
+      escapeCSV(code),
+      escapeCSV(item.name),
+      escapeCSV(item.location),
+      item.qty || 0,
+      item.qty1 || 0,
+      item.qty2 || 0,
+      item.qty3 || 0,
+      item.qty4 || 0,
+      item.qty5 || 0,
+      escapeCSV(item.scanTime)
+    ]);
+    
+    const csvContent = [
+      headers.map(escapeCSV).join(','),
+      ...rows.map(row => row.join(','))
+    ].join('\n');
+    
+    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Inventory_${user}_${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleUpload = async () => {
+    if (!navigator.onLine) {
+      return alert("No internet connection. Please try again when online.");
+    }
+    if (Object.keys(inventory).length === 0) return alert(t.noData);
+    if (!confirm(t.uploadConfirm)) return;
+    setIsLoading(true);
+    try {
+        const payload: any = {};
+        (Object.entries(inventory) as [string, InventoryItem][]).forEach(([key, item]) => {
+            const formatVal = (v: any) => (v === undefined || v === null || v === 0) ? "" : String(v);
+            payload[key] = {
+                name: item.name, location: item.location, scanTime: item.scanTime,
+                qty: formatVal(item.qty), qty1: formatVal(item.qty1), qty2: formatVal(item.qty2),
+                qty3: formatVal(item.qty3), qty4: formatVal(item.qty4), qty5: formatVal(item.qty5)
+            };
+        });
+        const response = await fetch(SYSTEM_CONFIG.API_URL, {
+            method: 'POST',
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({ user, items: payload })
+        });
+        const text = await response.text();
+        alert(t.uploadSuccess + " (" + text + ")");
+    } catch (e) {
+        alert(t.uploadFail + e);
+    } finally {
+        setIsLoading(false);
     }
   };
 
   return (
-    <div className="viewport" onClick={handleViewportClick}>
-        {/* --- Barcode Mode Elements --- */}
-        {mode === 'barcode' && (
-           <>
-             {/* Note: reader needs to exist for library, hidden via internal styles if not active, but we use conditional render for React cleaniness. Library usually handles remount fine if stopped. */}
-             <div id="reader" style={{display: isScanning ? 'block' : 'none'}}></div>
-             <canvas id="qr-canvas" ref={overlayCanvasRef} style={{display: isScanning ? 'block' : 'none'}} />
-             <div id="center-guide" className={tempCode ? 'guide-success' : ''} style={{display: isScanning ? 'block' : 'none'}}></div>
-             <div id="cam-hint-text" className="camera-hint" style={{display: isScanning ? 'flex' : 'none'}}>
-                {tempCode ? `${t.scanDetected}\n${tempCode}\n${t.scanConfirm}` : t.scannerStart}
-             </div>
-             {/* Start Hint for Barcode when not scanning */}
-             {!isScanning && (
-                <div style={{position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', color:'white', pointerEvents:'none'}}>
-                    <div style={{fontSize:'3rem', marginBottom:'10px', opacity:0.8}}>📷</div>
-                    <div style={{fontSize:'1.2rem', fontWeight:'bold'}}>{t.scannerStart}</div>
-                </div>
-             )}
-           </>
-        )}
+    <div className="max-w-3xl mx-auto p-2 pb-10 min-h-screen relative">
+      {isLoading && <div className="fixed inset-0 bg-black/85 z-[300] flex flex-col items-center justify-center text-white"><div className="w-10 h-10 border-4 border-gray-200 border-t-red-600 rounded-full animate-spin mb-4"></div><div className="font-bold">Uploading...</div></div>}
+      <div className="relative mb-3 pt-2">
+          <h2 className="text-center text-3xl font-bold text-gray-100 mt-2">{t.appTitle}</h2>
+          <button onClick={() => setIsLangModalOpen(true)} className="absolute top-1 right-2 w-10 h-10 bg-[#333] border border-gray-600 rounded-full flex items-center justify-center text-xl shadow-lg hover:bg-gray-700 z-20">⚙️</button>
+      </div>
+      <div className="flex flex-col gap-2 mb-3 bg-[#2c3e50] p-3 rounded-lg border-2 border-[#007bff] shadow-lg">
+        <div className="flex items-center gap-2"><label className="font-bold text-[#5dade2] w-24">{t.user}:</label><input type="text" value={user} onChange={(e) => setUser(e.target.value)} onBlur={(e) => handleUserChange(e.target.value)} className="flex-1 p-2 rounded bg-white text-black text-lg font-bold" /></div>
+        <div className="flex items-center gap-2 border-t border-gray-600 pt-2"><label className="font-bold text-[#f1c40f] w-24">{t.cycleCount}:</label><select value={checkIndex} onChange={handleCheckIndexChange} className="flex-1 p-2 rounded bg-[#333] text-white font-bold">
+            {/* 移除 G 欄位選項，從 Q1 開始 */}
+            <option value={1}>{t.count1}</option>
+            <option value={2}>{t.count2}</option>
+            <option value={3}>{t.count3}</option>
+            <option value={4}>{t.count4}</option>
+            <option value={5}>{t.count5}</option>
+        </select></div>
+      </div>
+      <div className="mode-switch mb-3"><button onClick={() => setMode('barcode')} className={`mode-btn ${mode === 'barcode' ? 'active' : ''}`}>{t.modeBarcode}<small>{t.modeBarcodeSub}</small></button><button onClick={() => setMode('ocr')} className={`mode-btn ${mode === 'ocr' ? 'active' : ''}`}>{t.modeOCR}<small>{t.modeOCRSub}</small></button></div>
+      <Scanner mode={mode} onScan={handleSaveItem} isScanning={isScanning} onToggleScan={setIsScanning} triggerFlash={flashOn} language={language} minLen={settings.minLen} maxLen={settings.maxLen} />
+      <div className="grid grid-cols-2 gap-3 mb-3"><button onClick={() => {if(confirm(t.clearAllConfirm)){setInventory({});localStorage.setItem(`inventory_${user}`,"{}")}}} className="h-12 bg-gray-600 rounded-lg font-bold">🗑️ {t.clear}</button><button onClick={() => setIsSettingsOpen(true)} className="h-12 bg-[#17a2b8] rounded-lg font-bold">⚙️ {t.settings}</button></div>
+      <div className="grid grid-cols-2 gap-3 mb-3"><button onClick={() => {}} className="h-12 bg-green-600 rounded-lg font-bold opacity-50 cursor-not-allowed">📤 {t.export}</button><button onClick={() => window.open(SYSTEM_CONFIG.SHEET_URL)} className="h-12 bg-[#6610f2] rounded-lg font-bold">📂 {t.openSheet}</button></div>
+      <button onClick={handleUpload} className="w-full bg-[#007bff] h-16 rounded-lg font-bold text-xl mb-4 shadow-xl">☁️ {t.upload}</button>
+      <InventoryTable inventory={inventory} settings={settings} onEdit={handleSaveItem} onDelete={c=>{if(confirm(t.deleteConfirm+c)){const n={...inventory};delete n[c];setInventory(n);localStorage.setItem(`inventory_${user}`,JSON.stringify(n))}}} onUpdateField={handleUpdateQty} checkIndex={checkIndex} language={language} />
+      
+      <div className="mt-4 mb-8">
+        <button onClick={handleExportExcel} className="w-full bg-green-600 h-16 rounded-lg font-bold text-xl shadow-xl text-white">
+          📥 {t.export}
+        </button>
+      </div>
 
-        {/* --- OCR Mode Elements --- */}
-        {mode === 'ocr' && (
-           <>
-             <video id="ocr-video" ref={videoRef} autoPlay playsInline style={{display: isScanning ? 'block' : 'none'}} />
-             <canvas ref={canvasRef} className="hidden" />
-             
-             {/* OCR Overlay structure */}
-             <div id="ocr-overlay" className="scan-guide-overlay" style={{display: isScanning ? 'block' : 'none'}}>
-                <div className={`guide-box ${ocrQuality ? 'ready' : ''} ${!isScanning ? 'paused' : ''}`}>
-                   <div className="guide-line"></div>
-                   <div className="guide-text">
-                      {ocrText === t.ocrProcessing ? t.ocrProcessing : (ocrQuality ? t.ocrReady : t.ocrWait)}
-                   </div>
-                </div>
-             </div>
-             
-             {/* Start Hint for OCR when not scanning */}
-             {!isScanning && (
-                <div style={{position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', color:'white', pointerEvents:'none'}}>
-                    <div style={{fontSize:'3rem', marginBottom:'10px', opacity:0.8}}>📝</div>
-                    <div style={{fontSize:'1.2rem', fontWeight:'bold'}}>{t.scannerStart}</div>
-                </div>
-             )}
-           </>
-        )}
+      <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} settings={settings} onSave={s=>{setSettings(s);localStorage.setItem('appSettings',JSON.stringify(s));setIsSettingsOpen(false)}} language={language} onLanguageChange={changeLanguage} />
     </div>
   );
 };
+
+export default App;
